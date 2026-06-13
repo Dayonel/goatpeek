@@ -5,8 +5,8 @@ const HYPE_WORDS: Record<string, number> = {
   pog: 6,
   poggers: 6,
   pogchamp: 6,
-  omegalul: 4,
-  kekw: 3,
+  omegalul: -4,
+  kekw: -3,
   ez: 3,
   ace: 8,
   '5k': 8,
@@ -26,8 +26,9 @@ const HYPE_WORDS: Record<string, number> = {
   wow: 10,
   ooo: 10,
   what: 10,
-  xd: 2,
-  lol: 4,
+  xd: -2,
+  lol: -4,
+  haha: -4,
 };
 
 // ─── FUZZY MATCHING LOGIC ──────────────────────────────────────────
