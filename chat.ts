@@ -23,6 +23,7 @@ const HYPE_WORDS: Record<string, number> = {
   cracked: 5,
   insane: 5,
   vac: 10,
+  wow: 10,
 };
 
 export class ChatMonitor {

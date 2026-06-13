@@ -1,11 +1,15 @@
 import { spawn, execSync } from 'child_process';
-import { existsSync, mkdirSync, rmSync, readFileSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, renameSync } from 'fs';
 import { join } from 'path';
 import { ChatMonitor } from './chat';
+import { MatchTracker } from './tracker';
 import 'dotenv/config';
 
 // ─── CONFIG ────────────────────────────────────────────────────────
 const CHANNEL = 'eslcsb';
+// Extract this ID from the HLTV match URL (e.g., .../matches/2394986/...)
+const MATCH_ID = 2394986;
+
 const OAUTH = process.env.TWITCH_OAUTH_TOKEN ?? '';
 const WORK_DIR = './work';
 const CLIPS_DIR = './clips';
@@ -23,15 +27,6 @@ const rm = (p: string) => {
   } catch {}
 };
 
-// ─── AI & PLAY DETECTION ───────────────────────────────────────────
-interface ClipMeta {
-  map: number;
-  round: number;
-  player: string;
-  description: string;
-}
-
-// Derive the description from the chat context, not the image
 function getPlayDescription(chatWords: string[]): string {
   if (chatWords.some((w) => ['ace', '5k'].includes(w))) return 'Ace';
   if (chatWords.includes('4k')) return '4K';
@@ -40,71 +35,6 @@ function getPlayDescription(chatWords: string[]): string {
   if (chatWords.some((w) => ['ninja', 'defuse'].includes(w)))
     return 'Ninja Defuse';
   return 'Highlight';
-}
-
-async function analyze(clip: string, chatWords: string[]): Promise<ClipMeta> {
-  const frame = join(WORK_DIR, `f_${Date.now()}.jpg`);
-  const midPoint = Math.floor((BUF_BEFORE + BUF_AFTER) / 2);
-
-  // 1. SURGICAL CROP: Extract only the top center (Score) and bottom center (Player)
-  // and stack them. This makes text huge and removes all visual distractions for the AI.
-  const cropFilter =
-    '[0:v]crop=800:150:560:0[top];[0:v]crop=800:150:560:930[bot];[top][bot]vstack';
-  execSync(
-    `ffmpeg -ss ${midPoint} -i "${clip}" -vframes 1 -filter_complex "${cropFilter}" "${frame}" -y -loglevel error`,
-  );
-
-  const imgBase64 = readFileSync(frame).toString('base64');
-  rm(frame);
-
-  const prompt = `This image contains two cropped UI elements from Counter-Strike 2.
-  Top element: Scoreboard showing Map Number (stars/pips) and Round Number.
-  Bottom element: Current Player Nameplate.
-  Extract the data and reply ONLY with this exact JSON format. Do not add any text or explanation:
-  {"map": 1, "round": 0, "player": "Name"}
-  If the player name is dead/empty, output "cmtry".`;
-
-  let meta = {
-    map: 1,
-    round: 0,
-    player: 'cmtry',
-    description: getPlayDescription(chatWords),
-  };
-
-  try {
-    const res = await fetch('http://localhost:11434/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'llava',
-        prompt,
-        images: [imgBase64],
-        stream: false,
-        format: 'json', // Force Ollama to strictly return valid JSON
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-
-    if (res.ok) {
-      const data = (await res.json()) as { response: string };
-      const parsed = JSON.parse(data.response);
-
-      meta.map = Number(parsed.map) || 1;
-      meta.round = Number(parsed.round) || 0;
-
-      const p = String(parsed.player).trim();
-      if (
-        p.length > 1 &&
-        !['unknown', 'null', 'name', 'cmtry'].includes(p.toLowerCase())
-      ) {
-        meta.player = p;
-      }
-    }
-  } catch (err) {
-    console.error('  [AI parsing failed, using fallbacks]');
-  }
-
-  return meta;
 }
 
 // ─── MAIN APP ──────────────────────────────────────────────────────
@@ -156,8 +86,13 @@ async function main() {
     if (match) currentVolume = parseFloat(match[1]);
   });
 
+  // Start Monitors
   const chat = new ChatMonitor(CHANNEL);
   chat.start();
+
+  const hltv = new MatchTracker(MATCH_ID);
+  hltv.start();
+
   let lastClipMs = 0;
 
   setInterval(() => {
@@ -182,13 +117,11 @@ async function main() {
     const now = Date.now();
     if (totalHype >= HYPE_THRESH && now - lastClipMs > COOLDOWN * 1000) {
       lastClipMs = now;
-      console.log(
-        `\n\n⚡ Hype Spike! (Score: ${totalHype}) Extracting clip...`,
-      );
+      console.log(`\n\n⚡ Hype Spike! Extracting clip...`);
 
       const playTimeMs = now - CHAT_DELAY * 1000;
 
-      setTimeout(async () => {
+      setTimeout(() => {
         const videoStartSec = Math.max(
           0,
           (playTimeMs - streamStartMs) / 1000 - BUF_BEFORE,
@@ -196,14 +129,16 @@ async function main() {
         const totalDuration = BUF_BEFORE + BUF_AFTER;
         const tmpClip = join(WORK_DIR, `tmp_${Date.now()}.mp4`);
 
+        // 1. Instantly pull clip from the buffer
         execSync(
           `ffmpeg -ss ${videoStartSec} -t ${totalDuration} -i "${LIVE_FILE}" -c copy "${tmpClip}" -y -loglevel error`,
         );
 
-        console.log('🤖 Parsing UI via LLaVA...');
-        const meta = await analyze(tmpClip, topWords);
+        // 2. Poll the MatchTracker memory for context (No AI required!)
+        const chatFallback = getPlayDescription(topWords);
+        const meta = hltv.getHighlightMeta(chatFallback);
 
-        // Sanitize strings for Windows file system safety
+        // Sanitize strings
         const safeDesc = meta.description.replace(/[<>:"/\\|?*]/g, '').trim();
         const safePlayer = meta.player.replace(/[<>:"/\\|?*]/g, '').trim();
 
