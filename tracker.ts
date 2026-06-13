@@ -9,6 +9,7 @@ export class MatchTracker {
 
   public mapNumber: number = 1;
   public roundNumber: number = 1;
+  public seriesMaps: string[] = [];
 
   private browser: any;
 
@@ -49,9 +50,24 @@ export class MatchTracker {
               0;
             const round = ctScore + tScore + 1;
 
-            if (ctScore === 0 && tScore === 0 && this.roundNumber > 1) {
-              this.mapNumber++;
+            // ✨ Sync mapNumber dynamically via the mapName sent by the socket
+            if (msgData.mapName) {
+              const cleanLiveMap = msgData.mapName
+                .replace('de_', '')
+                .toLowerCase();
+              const foundIndex = this.seriesMaps.findIndex(
+                (m) => m.includes(cleanLiveMap) || cleanLiveMap.includes(m),
+              );
+              if (foundIndex !== -1) {
+                this.mapNumber = foundIndex + 1;
+              }
+            } else {
+              // Standard Fallback: if we hit 0-0 and we are way past round 1, bump map manually
+              if (ctScore === 0 && tScore === 0 && this.roundNumber > 1) {
+                this.mapNumber++;
+              }
             }
+
             this.roundNumber = round;
           }
 
@@ -97,19 +113,63 @@ export class MatchTracker {
       await page.waitForNavigation({ timeout: 20000 }).catch(() => {});
     }
 
-    // 3. Scrape the Map Number from the DOM (fixes joining on Map 3)
+    // 3. ✨ Scrape the Map Number and Series Maps from the DOM
     try {
-      const domMapNum = await page.evaluate(() => {
+      const scrape = await page.evaluate(() => {
         const mapholders = document.querySelectorAll('.mapholder');
+        let activeMap = 1;
+        let mapNames: string[] = [];
+
         for (let i = 0; i < mapholders.length; i++) {
-          // HLTV flags the currently active map div with a 'playing' class
-          if (mapholders[i].querySelector('.playing')) return i + 1;
+          const text = mapholders[i].textContent || '';
+
+          // Get the map name (Usually in a div called .mapname)
+          const nameEl = mapholders[i].querySelector('.mapname');
+          if (nameEl) {
+            mapNames.push(nameEl.textContent.trim().toLowerCase());
+          } else {
+            // Fallback to finding standard map names anywhere in the box text
+            const m = text.match(
+              /(mirage|inferno|nuke|overpass|vertigo|ancient|anubis|dust2)/i,
+            );
+            mapNames.push(m ? m[0].toLowerCase() : `map${i + 1}`);
+          }
         }
-        return 1;
+
+        // Logic to guess the active map:
+        // 1. Look for HLTV's explicit 'playing' flag (Standard for Live Matches)
+        for (let i = 0; i < mapholders.length; i++) {
+          if (mapholders[i].querySelector('.playing')) {
+            return { activeMap: i + 1, mapNames };
+          }
+        }
+
+        // 2. Fallback: Find the FIRST map without a 'STATS' label.
+        // (If Map 1 is done, it has STATS. If Map 2 is live/next, it doesn't).
+        for (let i = 0; i < mapholders.length; i++) {
+          if (!mapholders[i].textContent?.includes('STATS')) {
+            return { activeMap: i + 1, mapNames };
+          }
+        }
+
+        // 3. If all maps are finished (Both have STATS), we default to the last map played.
+        return { activeMap: mapholders.length || 1, mapNames };
       });
-      this.mapNumber = domMapNum;
-      console.log(`🗺️  Detected Active Map: ${this.mapNumber}`);
-    } catch (err) {}
+
+      this.mapNumber = scrape.activeMap;
+      this.seriesMaps = scrape.mapNames;
+
+      if (this.seriesMaps.length > 0) {
+        console.log(
+          `🗺️  Detected Series Maps: ${this.seriesMaps.join(', ').toUpperCase()}`,
+        );
+      }
+      console.log(`🗺️  Estimated Active Map: ${this.mapNumber}`);
+    } catch (err) {
+      console.log(
+        '⚠️  Failed to scrape DOM for Map info. Defaulting to Map 1.',
+      );
+    }
 
     console.log('🟢 Connected to HLTV Live Game Logs via Puppeteer WebSocket!');
   }
