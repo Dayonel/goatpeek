@@ -24,6 +24,7 @@ const HYPE_WORDS: Record<string, number> = {
   insane: 5,
   vac: 10,
   wow: 10,
+  ooo: 10,
 };
 
 // ─── FUZZY MATCHING LOGIC ──────────────────────────────────────────

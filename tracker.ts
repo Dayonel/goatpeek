@@ -1,14 +1,14 @@
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
-// Use the exact stealth setup you know works
 puppeteer.use(StealthPlugin());
 
 export class MatchTracker {
-  private roundKills: Record<string, number> = {};
+  private currentRoundKills: Record<string, number> = {};
+  private previousRoundKills: Record<string, number> = {};
+
   public mapNumber: number = 1;
   public roundNumber: number = 1;
-  public lastPlay: { player: string; kills: number; ts: number } | null = null;
 
   private browser: any;
 
@@ -22,26 +22,21 @@ export class MatchTracker {
     this.browser = await puppeteer.launch({ headless: true });
     const page = await this.browser.newPage();
 
-    // ─── THE MAGIC ──────────────────────────────────────────────────────────
-    // Hook into the Chrome DevTools Protocol to listen to raw network traffic.
-    // We catch the live HLTV Scorebot WebSocket frames as they arrive.
+    // 1. Hook into raw network traffic
     const cdp = await page.target().createCDPSession();
     await cdp.send('Network.enable');
 
     cdp.on('Network.webSocketFrameReceived', (event: any) => {
       const payload = event.response?.payloadData;
 
-      // HLTV Scorebot uses standard Socket.io. Payload '42' means a message frame.
       if (typeof payload === 'string' && payload.startsWith('42')) {
         try {
-          // Parse the raw socket payload: e.g., '42["log", [ ... ]]'
           const parsed = JSON.parse(payload.substring(2));
           const msgType = parsed[0];
           const msgData = parsed[1];
 
-          // 1. Parse Scoreboard Updates (Map & Round)
+          // ─── PARSE MAP AND ROUND ───
           if (msgType === 'scoreboard') {
-            // Check possible HLTV JSON key variations
             const ctScore =
               msgData.counterTerroristScore ??
               msgData.ctTeamScore ??
@@ -60,7 +55,7 @@ export class MatchTracker {
             this.roundNumber = round;
           }
 
-          // 2. Parse Kills directly from live game log
+          // ─── PARSE KILLS ───
           if (msgType === 'log') {
             const events = Array.isArray(msgData)
               ? msgData
@@ -71,65 +66,96 @@ export class MatchTracker {
                 if ('Kill' in evt && evt.Kill) {
                   const killer = evt.Kill.killerName;
                   if (killer) {
-                    this.roundKills[killer] =
-                      (this.roundKills[killer] || 0) + 1;
-                    this.lastPlay = {
-                      player: killer,
-                      kills: this.roundKills[killer],
-                      ts: Date.now(),
-                    };
+                    this.currentRoundKills[killer] =
+                      (this.currentRoundKills[killer] || 0) + 1;
                   }
                 }
 
-                if ('RoundStart' in evt) {
-                  this.roundKills = {};
+                // If a round ends/starts, snapshot the stats to the 'previous' buffer.
+                // This bridges the gap for Twitch stream delay!
+                if ('RoundStart' in evt || 'RoundEnd' in evt) {
+                  if (Object.keys(this.currentRoundKills).length > 0) {
+                    this.previousRoundKills = { ...this.currentRoundKills };
+                  }
+                  if ('RoundStart' in evt) {
+                    this.currentRoundKills = {};
+                  }
                 }
               }
             }
           }
-        } catch (err) {
-          // Ignore JSON parse errors on malformed network frames
-        }
+        } catch (err) {}
       }
     });
 
-    // ─── PAGE NAVIGATION ────────────────────────────────────────────────────
-    // URL fallback to generic /match endpoint, HLTV handles the redirect naturally
+    // 2. Navigate to match page
     const matchUrl = `https://www.hltv.org/matches/${this.matchId}/match`;
-    console.log(`Navigating to ${matchUrl} to clear Cloudflare...`);
-
     await page.goto(matchUrl, { waitUntil: 'domcontentloaded' });
 
     const title = await page.title();
     if (title.includes('Just a moment')) {
-      console.log(
-        '⚠️ Cloudflare challenge detected! Waiting for StealthPlugin to clear it...',
-      );
-      // Let it sit and bypass naturally
       await page.waitForNavigation({ timeout: 20000 }).catch(() => {});
     }
 
-    console.log(
-      '🟢 Connected to HLTV Live Game Logs via Puppeteer WebSocket Interception!',
-    );
+    // 3. Scrape the Map Number from the DOM (fixes joining on Map 3)
+    try {
+      const domMapNum = await page.evaluate(() => {
+        const mapholders = document.querySelectorAll('.mapholder');
+        for (let i = 0; i < mapholders.length; i++) {
+          // HLTV flags the currently active map div with a 'playing' class
+          if (mapholders[i].querySelector('.playing')) return i + 1;
+        }
+        return 1;
+      });
+      this.mapNumber = domMapNum;
+      console.log(`🗺️  Detected Active Map: ${this.mapNumber}`);
+    } catch (err) {}
+
+    console.log('🟢 Connected to HLTV Live Game Logs via Puppeteer WebSocket!');
   }
 
   getHighlightMeta(chatDescFallback: string) {
-    const now = Date.now();
     let player = 'cmtry';
     let desc = chatDescFallback;
+    let maxKills = 0;
 
-    // If a play was logged recently (within 45s to account for stream delay)
-    if (this.lastPlay && now - this.lastPlay.ts < 45000) {
-      player = this.lastPlay.player;
-      const kills = this.lastPlay.kills;
-
-      if (kills === 5) desc = 'Ace';
-      else if (kills === 4) desc = '4K';
-      else if (kills === 3 && desc === 'Highlight') desc = '3K';
-      else if (kills === 2 && desc === 'Highlight') desc = '2K';
+    // 1. Who has the most kills in the CURRENT round?
+    let bestPlayer = '';
+    for (const [p, kills] of Object.entries(this.currentRoundKills)) {
+      if (kills > maxKills) {
+        maxKills = kills;
+        bestPlayer = p;
+      }
     }
 
+    // 2. Stream Delay Compensation: If Twitch reacts but the current HLTV round
+    // literally just started, check the PREVIOUS round for the multi-kill!
+    if (maxKills < 2) {
+      let prevMax = 0;
+      let prevBest = '';
+      for (const [p, kills] of Object.entries(this.previousRoundKills)) {
+        if (kills > prevMax) {
+          prevMax = kills;
+          prevBest = p;
+        }
+      }
+
+      if (prevMax >= 2) {
+        maxKills = prevMax;
+        bestPlayer = prevBest;
+      }
+    }
+
+    // 3. Assign Multi-kill Descriptions
+    if (bestPlayer) {
+      player = bestPlayer;
+      if (maxKills === 5) desc = 'Ace';
+      else if (maxKills === 4) desc = '4K';
+      else if (maxKills === 3 && desc === 'Highlight') desc = '3K';
+      else if (maxKills === 2 && desc === 'Highlight') desc = '2K';
+    }
+
+    // 4. Force override if chat was explicitly screaming "ninja defuse"
     if (chatDescFallback === 'Clutch' || chatDescFallback === 'Ninja Defuse') {
       desc = chatDescFallback;
     }

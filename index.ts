@@ -1,24 +1,38 @@
 import { spawn, execSync } from 'child_process';
-import { existsSync, mkdirSync, rmSync, renameSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  rmSync,
+  renameSync,
+  readFileSync,
+  createReadStream,
+} from 'fs';
 import { join } from 'path';
+import OpenAI from 'openai';
 import { ChatMonitor } from './chat';
 import { MatchTracker } from './tracker';
 import 'dotenv/config';
 
 // ─── CONFIG ────────────────────────────────────────────────────────
 const CHANNEL = 'eslcsb';
-// Extract this ID from the HLTV match URL (e.g., .../matches/2394986/...)
 const MATCH_ID = 2394986;
 
 const OAUTH = process.env.TWITCH_OAUTH_TOKEN ?? '';
+
+// Initialize the OpenAI SDK to point to your LOCAL Ollama instance
+const ollama = new OpenAI({
+  baseURL: 'http://localhost:11434/v1',
+  apiKey: 'ollama', // Required by the SDK, but totally ignored by Ollama
+});
+
 const WORK_DIR = './work';
 const CLIPS_DIR = './clips';
 const LIVE_FILE = join(WORK_DIR, 'live.ts');
 
 const HYPE_THRESH = 60;
 const CHAT_DELAY = 7;
-const BUF_BEFORE = 20;
-const BUF_AFTER = 20;
+const BUF_BEFORE = 40;
+const BUF_AFTER = 40;
 const COOLDOWN = 30;
 
 const rm = (p: string) => {
@@ -35,6 +49,64 @@ function getPlayDescription(chatWords: string[]): string {
   if (chatWords.some((w) => ['ninja', 'defuse'].includes(w)))
     return 'Ninja Defuse';
   return 'Highlight';
+}
+
+// ─── AUDIO AI PARSING ──────────────────────────────────────────────
+async function getPlayerFromAudio(clipPath: string): Promise<string> {
+  const audioFile = clipPath.replace('.mp4', '.mp3');
+  const txtFile = audioFile.replace('.mp3', '.txt');
+
+  try {
+    // 1. Extract 15 seconds of audio from the center of the clip (the action peak)
+    const midPoint = Math.max(0, BUF_BEFORE - 5);
+    execSync(
+      `ffmpeg -i "${clipPath}" -ss ${midPoint} -t 15 -q:a 0 -map a "${audioFile}" -y -loglevel error`,
+    );
+
+    // 2. Transcribe locally using Whisper CLI (Requires: pip install -U openai-whisper)
+    console.log(`\n🎙️  Transcribing audio locally...`);
+    execSync(
+      `whisper "${audioFile}" --model tiny.en --output_format txt --output_dir "${WORK_DIR}"`,
+      { stdio: 'ignore' },
+    );
+
+    let transcript = '';
+    if (existsSync(txtFile)) {
+      transcript = readFileSync(txtFile, 'utf8').trim();
+    }
+
+    console.log(`🎙️  Caster Transcript: "${transcript}"`);
+    if (!transcript) return 'cmtry';
+
+    // 3. Ask your local Ollama to find the name using the OpenAI SDK format
+    const prompt = `You are a data extractor. Read this CS2 caster commentary: "${transcript}"
+    Identify the player who made the highlight play. 
+    Reply ONLY with the player's exact name. No punctuation, no explanation.
+    If no clear player is mentioned, reply with "cmtry".`;
+
+    const completion = await ollama.chat.completions.create(
+      {
+        model: 'llama3', // Must match the exact model name pulled in Ollama
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0,
+      },
+      { timeout: 10000 }, // 10 second timeout
+    );
+
+    const name = completion.choices[0]?.message?.content
+      ?.trim()
+      .replace(/[.,!?'"]/g, '');
+    if (name && name.length > 1 && name.toLowerCase() !== 'cmtry') {
+      return name;
+    }
+  } catch (err) {
+    console.log('  [Audio parsing failed or skipped]');
+  } finally {
+    rm(audioFile);
+    rm(txtFile); // Clean up the text file too
+  }
+
+  return 'cmtry';
 }
 
 // ─── MAIN APP ──────────────────────────────────────────────────────
@@ -86,7 +158,6 @@ async function main() {
     if (match) currentVolume = parseFloat(match[1]);
   });
 
-  // Start Monitors
   const chat = new ChatMonitor(CHANNEL);
   chat.start();
 
@@ -121,7 +192,9 @@ async function main() {
 
       const playTimeMs = now - CHAT_DELAY * 1000;
 
-      setTimeout(() => {
+      // Because setTimeout creates a closure, 'totalHype' here will
+      // accurately reflect the hype score at the exact moment the threshold was crossed.
+      setTimeout(async () => {
         const videoStartSec = Math.max(
           0,
           (playTimeMs - streamStartMs) / 1000 - BUF_BEFORE,
@@ -129,20 +202,26 @@ async function main() {
         const totalDuration = BUF_BEFORE + BUF_AFTER;
         const tmpClip = join(WORK_DIR, `tmp_${Date.now()}.mp4`);
 
-        // 1. Instantly pull clip from the buffer
         execSync(
           `ffmpeg -ss ${videoStartSec} -t ${totalDuration} -i "${LIVE_FILE}" -c copy "${tmpClip}" -y -loglevel error`,
         );
 
-        // 2. Poll the MatchTracker memory for context (No AI required!)
-        const chatFallback = getPlayDescription(topWords);
-        const meta = hltv.getHighlightMeta(chatFallback);
+        // 1. Get accurate Map and Round from your HLTV socket
+        const map = hltv.mapNumber;
+        const round = hltv.roundNumber;
 
-        // Sanitize strings
-        const safeDesc = meta.description.replace(/[<>:"/\\|?*]/g, '').trim();
-        const safePlayer = meta.player.replace(/[<>:"/\\|?*]/g, '').trim();
+        // 2. Get Highlight Type from Chat Fuzzy Matcher, and append Hype Level
+        const baseDesc = getPlayDescription(topWords);
+        const descWithHype = `${baseDesc} (Hype ${Math.round(totalHype)})`;
 
-        const filename = `M${meta.map}R${meta.round} ｜ ${safePlayer} - ${safeDesc}.mp4`;
+        // 3. ✨ Listen to the caster to figure out who made the play (100% locally)
+        const rawPlayer = await getPlayerFromAudio(tmpClip);
+
+        // Clean strings for Windows filesystem
+        const safeDesc = descWithHype.replace(/[<>:"/\\|?*]/g, '').trim();
+        const safePlayer = rawPlayer.replace(/[<>:"/\\|?*]/g, '').trim();
+
+        const filename = `M${map}R${round} ｜ ${safePlayer} - ${safeDesc}.mp4`;
         const finalClip = join(CLIPS_DIR, filename);
 
         renameSync(tmpClip, finalClip);
