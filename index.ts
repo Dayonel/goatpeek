@@ -31,8 +31,8 @@ const LIVE_FILE = join(WORK_DIR, 'live.ts');
 
 const HYPE_THRESH = 60;
 const CHAT_DELAY = 7;
-const BUF_BEFORE = 40;
-const BUF_AFTER = 40;
+const BUF_BEFORE = 60;
+const BUF_AFTER = 60;
 const COOLDOWN = 30;
 
 const rm = (p: string) => {
