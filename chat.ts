@@ -26,6 +26,29 @@ const HYPE_WORDS: Record<string, number> = {
   wow: 10,
 };
 
+// ─── FUZZY MATCHING LOGIC ──────────────────────────────────────────
+// Pre-compile regular expressions for every hype word.
+// Example: 'poggers' -> collapsed: 'pogers' -> pattern: /^p+o+g+e+r+s+$/
+const HYPE_RULES = Object.entries(HYPE_WORDS).map(([word, score]) => {
+  // Remove consecutive duplicate characters from the base word
+  const collapsedWord = word.replace(/(.)\1+/g, '$1');
+
+  // Create a regex allowing 1 or more of each character in sequence
+  const pattern =
+    '^' +
+    collapsedWord
+      .split('')
+      .map((c) => `[${c}]+`)
+      .join('') +
+    '$';
+
+  return {
+    word, // The standard canonical word (e.g., 'wow')
+    score, // The score mapping
+    regex: new RegExp(pattern), // Compiled Regex
+  };
+});
+
 export class ChatMonitor {
   private ws!: WebSocket;
   private msgs: { ts: number; score: number; words: string[] }[] = [];
@@ -49,9 +72,29 @@ export class ChatMonitor {
       const match = text.match(/PRIVMSG #[^\s]+ :(.+)/);
       if (!match) return;
 
-      const words = match[1].toLowerCase().trim().split(/\s+/);
-      const found = words.filter((w) => HYPE_WORDS[w]);
-      const score = found.reduce((sum, w) => sum + HYPE_WORDS[w], 0);
+      // 1. Convert to lowercase
+      // 2. Strip out punctuation (so "OMGGGG!!!" becomes "omgggg")
+      const rawMessage = match[1]
+        .toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .trim();
+      if (!rawMessage) return;
+
+      const words = rawMessage.split(/\s+/);
+      const found: string[] = [];
+      let score = 0;
+
+      // Check each word in the chat message against our fuzzy regex rules
+      for (const w of words) {
+        for (const rule of HYPE_RULES) {
+          if (rule.regex.test(w)) {
+            // Push the *canonical* word (so "woooow" gets tracked as simply "wow")
+            found.push(rule.word);
+            score += rule.score;
+            break; // Stop checking other rules for this specific word
+          }
+        }
+      }
 
       this.msgs.push({ ts: Date.now(), score, words: found });
     });
